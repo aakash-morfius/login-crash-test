@@ -1,7 +1,7 @@
 // Repeats "open an app link logged out -> log in -> redirected back" in a fresh Chrome Incognito profile and
 // records whether the tab crashed ("Aw, Snap"). Saves a screenshot of every run plus results.csv / summary.txt.
 //
-// Works on Windows and macOS. Usage:
+// Works on Windows, macOS and Linux (desktop session). Usage:
 //   npm install                               # once
 //   node crash-test.cjs                       # 10 runs, asks for email and password
 //   node crash-test.cjs --runs 20
@@ -25,14 +25,33 @@ const RUNS = Number(arg("runs", "10"));
 const URL = arg("url", "https://papaya.morfius.ai/app/MVPBUPR55SHJAPUX/");
 let EMAIL = arg("email", process.env.MORFIUS_EMAIL || "");
 const WAIT_AFTER_LOGIN_MS = Number(arg("wait", "20000"));
-const DEFAULT_CHROME = {
-  win32: "C:/Program Files/Google/Chrome/Application/chrome.exe",
-  darwin: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  linux: "/usr/bin/google-chrome",
-}[process.platform];
-const CHROME = arg("chrome", DEFAULT_CHROME);
+// Standard install paths; the first one that exists is used. Chromium works too, but test real Chrome if you can.
+const CHROME_CANDIDATES = {
+  win32: [
+    "C:/Program Files/Google/Chrome/Application/chrome.exe",
+    "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
+    `${process.env.LOCALAPPDATA}/Google/Chrome/Application/chrome.exe`,
+  ],
+  darwin: [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    `${os.homedir()}/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`,
+  ],
+  linux: [
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/opt/google/chrome/chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/snap/bin/chromium",
+  ],
+}[process.platform] ?? [];
+const CHROME = arg("chrome", "") || CHROME_CANDIDATES.find((p) => fs.existsSync(p));
 if (!CHROME || !fs.existsSync(CHROME)) {
-  console.error(`Chrome not found at "${CHROME}". Pass its path with --chrome "<path to chrome>".`);
+  console.error(`Chrome not found${CHROME ? ` at "${CHROME}"` : ""}. Pass its path with --chrome "<path to chrome>".`);
+  process.exit(1);
+}
+if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+  console.error("No desktop session found (DISPLAY / WAYLAND_DISPLAY unset). Run this from a desktop session, not over plain SSH.");
   process.exit(1);
 }
 const PORT = 9400;
@@ -84,11 +103,25 @@ function screenshotScreen(file) {
       execFileSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", capturePs, file], { stdio: "ignore" });
     // macOS asks once for Screen Recording permission for the terminal app.
     else if (process.platform === "darwin") execFileSync("screencapture", ["-x", file], { stdio: "ignore" });
-    else execFileSync("import", ["-window", "root", file], { stdio: "ignore" });
+    else return linuxScreenshot(file);
     return true;
   } catch {
     return false;
   }
+}
+
+// Linux has no built-in screenshot command, so try the common ones in turn.
+function linuxScreenshot(file) {
+  const tools = process.env.WAYLAND_DISPLAY
+    ? [["grim", [file]], ["gnome-screenshot", ["-f", file]], ["spectacle", ["-b", "-n", "-f", "-o", file]]]
+    : [["gnome-screenshot", ["-f", file]], ["scrot", ["-o", file]], ["import", ["-window", "root", file]], ["spectacle", ["-b", "-n", "-f", "-o", file]]];
+  for (const [cmd, args] of tools) {
+    try {
+      execFileSync(cmd, args, { stdio: "ignore", timeout: 10000 });
+      if (fs.existsSync(file)) return true;
+    } catch {}
+  }
+  return false;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -154,7 +187,12 @@ async function oneRun(n, password) {
     await page.bringToFront().catch(() => {});
     await sleep(1500);
     result.screenshot = `run-${String(n).padStart(2, "0")}-${result.status}.png`;
-    if (!screenshotScreen(path.join(OUT, result.screenshot))) result.screenshot = "(screenshot failed)";
+    const shotFile = path.join(OUT, result.screenshot);
+    // If no screen-capture tool works, a page that didn't crash can still be captured by the browser itself.
+    if (!screenshotScreen(shotFile)) {
+      const ok = !result.crashed && (await page.screenshot({ path: shotFile }).then(() => true).catch(() => false));
+      if (!ok) result.screenshot = "(screenshot failed)";
+    }
   } catch (e) {
     result.status = "ERROR";
     result.error = String(e.message || e).split("\n")[0];
